@@ -26,11 +26,13 @@ import re
 import secrets
 import string
 import logging
+from er_ocr_endpoint import router as ocr_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Precinct-Cluster-Extractor", version="1.0.0")
+app.include_router(ocr_router)
 
 PRECINCT_RE = re.compile(r'^\d{4}[A-Z]$')
 CLUSTER_NUM_RE = re.compile(r'^\d{1,3}$')
