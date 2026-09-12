@@ -1,0 +1,112 @@
+# New file - added alongside your existing PDF extraction file, not
+# merged into it. This is a FastAPI *router*, not its own app - Render
+# only runs one app object per service, so this needs to be mounted
+# onto your existing app with two lines (shown below), rather than
+# being a second, separately-running FastAPI() instance that would
+# never actually get served.
+#
+# Never overwrites vote_counts (the watcher's own entry, which stays
+# authoritative). Only ever writes to the separate ocr_* columns,
+# flagging a discrepancy ONLY when OCR confidently recognized a real
+# candidate name AND its number disagrees with what was typed - never
+# flags a candidate OCR couldn't confidently read at all.
+#
+# Requires: pytesseract, Pillow, opencv-python-headless, requests
+# System dependency: tesseract-ocr must be installed on the Render
+# instance itself (add "apt-get install tesseract-ocr" to the build
+# step, or use a Dockerfile that includes it - pytesseract is just a
+# Python wrapper around the real tesseract binary, which must exist
+# on the machine).
+#
+# --- In your EXISTING main file, add just these two lines: ---
+#   from er_ocr_endpoint import router as ocr_router
+#   app.include_router(ocr_router)
+# (assumes your existing FastAPI() instance is named "app" - if it's
+# named something else, use that name instead)
+
+import difflib
+import re
+
+import cv2
+import numpy as np
+import pytesseract
+import requests
+from fastapi import APIRouter
+from pydantic import BaseModel
+
+router = APIRouter()
+
+
+class OcrRequest(BaseModel):
+    image_url: str
+    candidate_names: list[str]
+
+
+def preprocess_image(image_bytes: bytes) -> np.ndarray:
+    """Grayscale, contrast boost, and adaptive threshold - a real
+    phone photo of a printed ER has uneven lighting and glare that
+    plain OCR handles poorly without this."""
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # CLAHE evens out uneven lighting/glare better than a flat contrast stretch.
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    contrasted = clahe.apply(gray)
+    thresh = cv2.adaptiveThreshold(
+        contrasted, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11
+    )
+    return thresh
+
+
+def fuzzy_match_name(line: str, candidate_names: list[str]) -> str | None:
+    """OCR will introduce minor character errors in names - fuzzy
+    matching against the REAL, known candidate list (not guessing at
+    arbitrary text) keeps this safe: it can only ever "recognize" a
+    name that's genuinely in the database, never invent one."""
+    line_upper = line.upper().strip()
+    matches = difflib.get_close_matches(line_upper, candidate_names, n=1, cutoff=0.75)
+    if matches:
+        return matches[0]
+    # Also try matching just the start of the line, since OCR often
+    # runs the name and number together without a clean word boundary.
+    for name in candidate_names:
+        if difflib.SequenceMatcher(None, line_upper[:len(name) + 3], name).ratio() > 0.8:
+            return name
+    return None
+
+
+@router.post("/extract-er-ocr")
+def extract_er_ocr(req: OcrRequest):
+    try:
+        resp = requests.get(req.image_url, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        return {"status": "failed", "error": f"Could not download image: {e}"}
+
+    try:
+        processed = preprocess_image(resp.content)
+        raw_text = pytesseract.image_to_string(processed)
+    except Exception as e:
+        return {"status": "failed", "error": f"OCR processing failed: {e}"}
+
+    extracted_votes: dict[str, int] = {}
+    for line in raw_text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        # Look for a trailing number on the line - the ER's own
+        # layout puts the vote count at the end of each candidate row.
+        number_match = re.search(r"(\d{1,5})\s*$", line)
+        if not number_match:
+            continue
+        name_part = line[: number_match.start()].strip()
+        matched_name = fuzzy_match_name(name_part, req.candidate_names)
+        if matched_name and matched_name not in extracted_votes:
+            extracted_votes[matched_name] = int(number_match.group(1))
+
+    return {
+        "status": "completed",
+        "extracted_votes": extracted_votes,
+        "candidates_recognized": len(extracted_votes),
+        "candidates_expected": len(req.candidate_names),
+    }
