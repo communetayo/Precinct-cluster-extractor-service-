@@ -2,3 +2,6 @@ fastapi
 uvicorn
 pdfplumber
 requests
+pytesseract
+opencv-python-headless
+numpy
