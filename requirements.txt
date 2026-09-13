@@ -5,3 +5,5 @@ requests
 easyocr
 opencv-python-headless
 numpy
+pypdf
+reportlab
