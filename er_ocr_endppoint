@@ -1,32 +1,20 @@
-# New file - added alongside your existing PDF extraction file, not
-# merged into it. This is a FastAPI *router*, not its own app - Render
-# only runs one app object per service, so this needs to be mounted
-# onto your existing app with two lines (shown in main.py), rather
-# than being a second, separately-running FastAPI() instance that
-# would never actually get served.
-#
-# Uses easyocr rather than pytesseract - pytesseract needs a separate
-# system program (tesseract) installed on the machine itself, which
-# Render's standard Python environment cannot do (apt-get fails there
-# with a read-only filesystem error). easyocr installs entirely
-# through pip, avoiding that problem completely, at the cost of a
-# larger download and higher memory use on first load.
-#
-# Never overwrites vote_counts (the watcher's own entry, which stays
-# authoritative). Only ever writes to the separate ocr_* columns,
-# flagging a discrepancy ONLY when OCR confidently recognized a real
-# candidate name AND its number disagrees with what was typed - never
-# flags a candidate OCR couldn't confidently read at all.
-#
-# Requirements.txt needs: easyocr, opencv-python-headless, numpy, requests
-# (remove pytesseract - no longer used)
-#
-# --- In your EXISTING main.py, these two lines should already be there: ---
+# FastAPI router (not a standalone app) - mounted onto the existing
+# Render service alongside main.py, with two lines added there:
 #   from er_ocr_endpoint import router as ocr_router
 #   app.include_router(ocr_router)
+#
+# Uses easyocr specifically, not pytesseract - Render's filesystem is
+# read-only at runtime, so apt-get (needed to install the tesseract
+# system binary) simply fails there. easyocr installs entirely through
+# pip, no system dependency at all, which is why it was chosen over
+# the more commonly-used alternative.
+#
+# requirements.txt needs: fastapi, uvicorn, easyocr, opencv-python-headless,
+# numpy, requests (pydantic comes in transitively via fastapi)
 
-import difflib
+import io
 import re
+from difflib import get_close_matches
 
 import cv2
 import numpy as np
@@ -36,11 +24,11 @@ from pydantic import BaseModel
 
 router = APIRouter()
 
-# Loaded once, reused across requests - loading this fresh on every
-# call would be extremely slow. First request after a deploy will be
-# slow while this initial load happens; subsequent ones are fast.
+# Loaded once, at import time, rather than per-request - easyocr's
+# own model loading is the slow part, and re-doing it on every single
+# call would make this endpoint impractically slow.
 import easyocr
-_reader = easyocr.Reader(['en'], gpu=False)
+_reader = easyocr.Reader(["en"], gpu=False)
 
 
 class OcrRequest(BaseModel):
@@ -48,48 +36,8 @@ class OcrRequest(BaseModel):
     candidate_names: list[str]
 
 
-def preprocess_image(image_bytes: bytes) -> np.ndarray:
-    """Grayscale and contrast boost - a real phone photo of a printed
-    ER has uneven lighting and glare that raw OCR handles poorly
-    without this."""
-    arr = np.frombuffer(image_bytes, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    return clahe.apply(gray)
-
-
-def fuzzy_match_name(text: str, candidate_names: list[str]) -> str | None:
-    """OCR will introduce minor character errors in names - fuzzy
-    matching against the REAL, known candidate list (not guessing at
-    arbitrary text) keeps this safe: it can only ever "recognize" a
-    name that's genuinely in the database, never invent one."""
-    text_upper = text.upper().strip()
-    matches = difflib.get_close_matches(text_upper, candidate_names, n=1, cutoff=0.75)
-    return matches[0] if matches else None
-
-
-def group_into_rows(ocr_results, y_tolerance: int = 15) -> list[list]:
-    """easyocr returns each detected text block with its own bounding
-    box, not pre-joined lines - this groups blocks that share roughly
-    the same vertical position back into a single row, since the ER's
-    layout puts a candidate's name and vote count side by side on one
-    printed line."""
-    rows: list[list] = []
-    for bbox, text, confidence in ocr_results:
-        y_center = (bbox[0][1] + bbox[2][1]) / 2
-        placed = False
-        for row in rows:
-            row_y = row[0][3]
-            if abs(row_y - y_center) < y_tolerance:
-                row.append((bbox[0][0], text, confidence, y_center))
-                placed = True
-                break
-        if not placed:
-            rows.append([(bbox[0][0], text, confidence, y_center)])
-    for row in rows:
-        row.sort(key=lambda item: item[0])  # left to right within the row
-    return rows
+def _normalize(text: str) -> str:
+    return re.sub(r"[^A-Z0-9 ]", "", text.upper()).strip()
 
 
 @router.post("/extract-er-ocr")
@@ -98,30 +46,64 @@ def extract_er_ocr(req: OcrRequest):
         resp = requests.get(req.image_url, timeout=20)
         resp.raise_for_status()
     except Exception as e:
-        return {"status": "failed", "error": f"Could not download image: {e}"}
+        return {"status": "failed", "error": f"Could not download the photo: {e}"}
 
     try:
-        processed = preprocess_image(resp.content)
-        ocr_results = _reader.readtext(processed)
-    except Exception as e:
-        return {"status": "failed", "error": f"OCR processing failed: {e}"}
+        image_array = np.frombuffer(resp.content, dtype=np.uint8)
+        image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+        if image is None:
+            return {"status": "failed", "error": "Could not decode the image."}
 
-    rows = group_into_rows(ocr_results)
+        # readtext returns a list of (bounding_box, text, confidence) -
+        # bounding_box is 4 corner points, used below to figure out
+        # which detected number sits on the same physical line as
+        # which detected candidate name.
+        results = _reader.readtext(image)
+    except Exception as e:
+        return {"status": "failed", "error": f"OCR itself failed: {e}"}
+
+    # Splits every detected text block into "looks like a name" versus
+    # "looks like a number" - a real ER has candidate names on the
+    # left and their vote count on the right, on the same row.
+    name_blocks = []
+    number_blocks = []
+    for bbox, text, confidence in results:
+        cleaned = _normalize(text)
+        if not cleaned:
+            continue
+        y_center = sum(point[1] for point in bbox) / 4
+        x_center = sum(point[0] for point in bbox) / 4
+        if re.fullmatch(r"\d+", cleaned):
+            number_blocks.append({"value": int(cleaned), "x": x_center, "y": y_center})
+        else:
+            name_blocks.append({"text": cleaned, "x": x_center, "y": y_center})
 
     extracted_votes: dict[str, int] = {}
-    for row in rows:
-        row_text = " ".join(item[1] for item in row)
-        number_match = re.search(r"(\d{1,5})\s*$", row_text.strip())
-        if not number_match:
-            continue
-        name_part = row_text[: number_match.start()].strip()
-        matched_name = fuzzy_match_name(name_part, req.candidate_names)
-        if matched_name and matched_name not in extracted_votes:
-            extracted_votes[matched_name] = int(number_match.group(1))
+    normalized_candidates = {_normalize(name): name for name in req.candidate_names}
 
-    return {
-        "status": "completed",
-        "extracted_votes": extracted_votes,
-        "candidates_recognized": len(extracted_votes),
-        "candidates_expected": len(req.candidate_names),
-    }
+    for block in name_blocks:
+        # Only counts as a real match above a genuine similarity
+        # threshold - a garbled OCR read that doesn't clearly match
+        # any real candidate is skipped entirely rather than guessed
+        # at, since a wrong match here would misattribute real votes.
+        matches = get_close_matches(
+            block["text"], normalized_candidates.keys(), n=1, cutoff=0.75
+        )
+        if not matches:
+            continue
+        real_name = normalized_candidates[matches[0]]
+        if real_name in extracted_votes:
+            continue  # Already matched this candidate from an earlier block.
+
+        # The nearest number block on roughly the same horizontal row,
+        # and to the right of the name (since that's the real layout
+        # of an ER - name on the left, vote count on the right).
+        same_row_numbers = [
+            n for n in number_blocks
+            if abs(n["y"] - block["y"]) < 20 and n["x"] > block["x"]
+        ]
+        if same_row_numbers:
+            closest = min(same_row_numbers, key=lambda n: n["x"] - block["x"])
+            extracted_votes[real_name] = closest["value"]
+
+    return {"status": "completed", "extracted_votes": extracted_votes}
