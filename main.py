@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Precinct-Cluster-Extractor", version="1.0.0")
 app.include_router(ocr_router)
+from appointment_letter_endpoint import router as letter_router
+app.include_router(letter_router)
 
 PRECINCT_RE = re.compile(r'^\d{4}[A-Z]$')
 CLUSTER_NUM_RE = re.compile(r'^\d{1,3}$')
