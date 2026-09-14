@@ -1,9 +1,12 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 fastapi
 uvicorn
 pdfplumber
 requests
+pypdf
+reportlab
 easyocr
 opencv-python-headless
 numpy
-pypdf
-reportlab
+torch
+torchvision
