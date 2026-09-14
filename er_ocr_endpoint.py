@@ -28,7 +28,20 @@ router = APIRouter()
 # own model loading is the slow part, and re-doing it on every single
 # call would make this endpoint impractically slow.
 import easyocr
-_reader = easyocr.Reader(["en"], gpu=False)
+# Loaded LAZILY, on the first real request - not at import time. The
+# model previously loaded the instant this file was imported, meaning
+# it competed for memory with the server's own startup itself, before
+# a single request had even arrived. Now the server can finish
+# booting successfully first, and only pays the (still real) memory
+# cost of loading the model once actual OCR work is asked for.
+_reader = None
+
+
+def _get_reader():
+    global _reader
+    if _reader is None:
+        _reader = easyocr.Reader(["en"], gpu=False)
+    return _reader
 
 
 class OcrRequest(BaseModel):
@@ -58,7 +71,7 @@ def extract_er_ocr(req: OcrRequest):
         # bounding_box is 4 corner points, used below to figure out
         # which detected number sits on the same physical line as
         # which detected candidate name.
-        results = _reader.readtext(image)
+        results = _get_reader().readtext(image)
     except Exception as e:
         return {"status": "failed", "error": f"OCR itself failed: {e}"}
 
